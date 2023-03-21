@@ -24,7 +24,6 @@ import (
 	"go.opentelemetry.io/otel/exporters/prometheus"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/instrument"
-	"go.opentelemetry.io/otel/propagation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	sdkresource "go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -93,17 +92,19 @@ func main() {
 	conn, err := grpc.DialContext(ctx, os.Getenv(grpcCollectorAddressEnvKey),
 		// Note the use of insecure transport here. TLS is recommended in production.
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
 	)
 	if err != nil {
 		log.WithError(err).Error("Failed to create gRPC connection to collector")
 	} else {
+		log.Info("Set up tracing - 1")
 		// Set up the OpenTelemetry tracing stack
 		// Set up a trace exporter
 		traceExporter, err := otlptracegrpc.New(ctx, otlptracegrpc.WithGRPCConn(conn))
 		if err != nil {
 			log.WithError(err).Fatal("Failed to create trace exporter: %w", err)
 		}
+
+		log.Info("Set up tracing - 2")
 
 		// Register the trace exporter with a TracerProvider, using a batch
 		// span processor to aggregate spans before export.
@@ -116,7 +117,8 @@ func main() {
 		otel.SetTracerProvider(tracerProvider)
 
 		// set global propagator to tracecontext (the default is no-op).
-		otel.SetTextMapPropagator(propagation.TraceContext{})
+		// otel.SetTextMapPropagator(propagation.TraceContext{})
+		log.Info("Set up tracing - 3")
 
 		tracer = otel.Tracer(service)
 	}
@@ -261,7 +263,7 @@ func generateStandardHTTPMetrics(tracer trace.Tracer, wg *sync.WaitGroup, ctx co
 	max := 100
 
 	// Set up HTTP server metrics
-	server := httptest.NewServer(getHTTPHandlerFunc(tracer, "/", min, max))
+	server := httptest.NewServer(getHTTPHandlerFunc(tracer, "serve_root", min, max))
 
 	wg.Add(1)
 	go func() {
@@ -275,7 +277,7 @@ func generateStandardHTTPMetrics(tracer trace.Tracer, wg *sync.WaitGroup, ctx co
 			case <-ticker.C:
 				uri, _ := url.ParseRequestURI(server.URL)
 				uri = uri.JoinPath("/")
-				if err := doHTTPRequest(tracer, client, uri, "/", ctx); err != nil {
+				if err := doHTTPRequest(tracer, client, uri, "get_root", ctx); err != nil {
 					log.WithError(err).Errorf("Cannot do request to %s", server.URL)
 				}
 			case <-ctx.Done():
@@ -297,9 +299,9 @@ func generateGorillaHTTPMetrics(tracer trace.Tracer, wg *sync.WaitGroup, ctx con
 	r := mux.NewRouter()
 
 	// Add paths
-	r.Methods("GET").Path("/").HandlerFunc(getHTTPHandlerFunc(tracer, "/", 10, 100))
-	r.Methods("GET").Path("/test1").HandlerFunc(getHTTPHandlerFunc(tracer, "/test1", 50, 150))
-	r.Methods("GET").Path("/test1/{resource1}").HandlerFunc(getHTTPHandlerFunc(tracer, "/test1/{resource1}", 20, 50))
+	r.Methods("GET").Path("/").HandlerFunc(getHTTPHandlerFunc(tracer, "serve_root", 10, 100))
+	r.Methods("GET").Path("/test1").HandlerFunc(getHTTPHandlerFunc(tracer, "serve_test1", 50, 150))
+	r.Methods("GET").Path("/test1/{resource1}").HandlerFunc(getHTTPHandlerFunc(tracer, "serve_test1_resource1", 20, 50))
 
 	// Get random port for server and serve
 	listener, err := net.Listen("tcp", ":0")
@@ -326,9 +328,9 @@ func generateGorillaHTTPMetrics(tracer trace.Tracer, wg *sync.WaitGroup, ctx con
 			case <-ticker.C:
 				host := fmt.Sprintf("http://127.0.0.1:%d", port)
 				patterns := map[string]string{
-					"/":                  "/",
-					"/test1":             "/test1",
-					"/test1/{resource1}": "/test1/12345",
+					"get_root":            "/",
+					"get_test1":           "/test1",
+					"get_test1_resource1": "/test1/12345",
 				}
 				for pattern, path := range patterns {
 					uri, _ := url.ParseRequestURI(host)
