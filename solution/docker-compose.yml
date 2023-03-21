@@ -3,11 +3,11 @@ version: '3'
 services:
   influxdb:
     image: influxdb:2.6-alpine
-    # env_file:
-    #   - influxv2.env
+    env_file:
+      - ./config/influx/influx.env
     volumes:
       # Mount for influxdb data directory and configuration
-      - ./data/influxdbv2:/var/lib/influxdb2:rw
+      - ./data/influx:/var/lib/influxdb2:rw
     ports:
       - "8086:8086"
 
@@ -17,9 +17,9 @@ services:
       - influxdb
     volumes:
       # Mount for telegraf config
-      - ./data/telegraf/mytelegraf.conf:/etc/telegraf/telegraf.conf:ro
-    # env_file:
-    #   - influxv2.env
+      - ./config/telegraf/mytelegraf.conf:/etc/telegraf/telegraf.conf:ro
+    env_file:
+      - ./config/influx/influx.env
     
   grafana:
    image: grafana/grafana
