@@ -1,4 +1,4 @@
 data/*
-
+config/influx/influx-configs
 
 !/**/.gitkeep
