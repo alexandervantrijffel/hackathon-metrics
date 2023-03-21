@@ -5,7 +5,6 @@ services:
     container_name: influxdb
     image: influxdb:2.6-alpine
     volumes:
-      # Mount for influxdb data directory and configuration
       - ./data/influx:/var/lib/influxdb2:rw
       - ./config/influx:/etc/influxdb2
     ports:
@@ -26,11 +25,9 @@ services:
     depends_on:
       - influxdb
     volumes:
-      # Mount for telegraf config
       - ./config/telegraf/mytelegraf.conf:/etc/telegraf/telegraf.conf:ro
     
   grafana:
-   container_name: grafana
    image: grafana/grafana
    container_name: grafana-server
    restart: always
