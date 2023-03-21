@@ -31,8 +31,6 @@ services:
     volumes:
       # Mount for telegraf config
       - ./config/telegraf/mytelegraf.conf:/etc/telegraf/telegraf.conf:ro
-    env_file:
-      - ./config/influx/influx.env
     
   grafana:
    image: grafana/grafana
