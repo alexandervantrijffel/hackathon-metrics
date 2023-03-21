@@ -3,13 +3,26 @@ version: '3'
 services:
   influxdb:
     image: influxdb:2.6-alpine
-    env_file:
-      - ./config/influx/influx.env
     volumes:
       # Mount for influxdb data directory and configuration
       - ./data/influx:/var/lib/influxdb2:rw
+      - ./config/influx:/etc/influxdb2
     ports:
       - "8086:8086"
+    environment:
+      - INFLUX_DB=influx
+      - INFLUX_ADMIN_USER=admin
+      - INFLUX_ADMIN_PASSWORD=admin
+      - DOCKER_INFLUX_ADMIN_USER=admin
+      - DOCKER_INFLUX_ADMIN_PASSWORD=admin
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_ORG=NS
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=admin
+      - DOCKER_INFLUXDB_INIT_BUCKET=sample
+      - DOCKER_INFLUXDB_INIT_RETENTION=1w
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=12345678
+
 
   telegraf:
     image: telegraf:1.25-alpine
