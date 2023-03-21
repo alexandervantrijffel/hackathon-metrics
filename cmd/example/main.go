@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"math/rand"
@@ -14,52 +15,69 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/prometheus"
+	api "go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/instrument"
+	"go.opentelemetry.io/otel/sdk/metric"
 
 	log "github.com/sirupsen/logrus"
+)
+
+const (
+	service string = "metrics_example"
+	team    string = "team_awesome"
 )
 
 func main() {
 	log.SetLevel(log.DebugLevel)
 	log.Info("Starting Golang Metrics Example Service")
 
-	service := "GolangMetricsExampleService"
-	// TODO: set up metrics SDK with e.g. endpoints and tags
-	// spoolDirectory := chainmonitoring.DefaultSpoolDirectory
-	// if _, err := os.Stat(spoolDirectory); os.IsNotExist(err) {
-	// 	log.Warn("Default spool directory does not exist, spooling to temp directory")
-	// 	spoolDirectory = os.TempDir()
-	// }
+	// Set up the Prometheus exporter
+	exporter, err := prometheus.New()
+	if err != nil {
+		log.Fatal(err)
+	}
+	provider := metric.NewMeterProvider(metric.WithReader(exporter))
+	meter := provider.Meter(service)
 
-	// cm := chainmonitoring.Get().WithConfig(chainmonitoring.ChainMonitoringConfig{
-	// 	Service:        service,
-	// 	SpoolFileName:  "golang_example_service",
-	// 	SpoolDirectory: spoolDirectory,
-	// 	FlushInterval:  time.Second * 5,
-	// })
+	// Start the Prometheus HTTP server
+	go serveMetrics()
 
-	log.Infof("Tags: service=%s", service)
-	// log.Infof("Spooling generic metrics to %s", cm.GetMetricsSpoolFilePath())
-	// log.Infof("Spooling stats to %s", cm.GetStatsSpoolFilePath())
-
-	// cm.Start()
-	// defer cm.Stop()
+	// Set up attributes (tags)
+	attrs := []attribute.KeyValue{
+		attribute.Key("service").String(service),
+		attribute.Key("team").String(team),
+	}
 
 	wg := sync.WaitGroup{}
-	done := make(chan interface{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer func() {
 		log.Debug("Waiting for goroutines to finish")
-		close(done)
+		cancel()
 		wg.Wait()
+		log.Debug("Goroutines finished")
 	}()
 
-	generateTrigonoMetrics(&wg, done)
-	generateStandardHTTPMetrics(&wg, done)
-	generateGorillaHTTPMetrics(&wg, done)
+	generateTrigonoMetrics(meter, attrs, &wg, ctx)
+	generateStandardHTTPMetrics(meter, attrs, &wg, ctx)
+	generateGorillaHTTPMetrics(meter, attrs, &wg, ctx)
 
 	waitForInterrupt()
 }
 
-func generateTrigonoMetrics(wg *sync.WaitGroup, done chan interface{}) {
+func serveMetrics() {
+	log.Printf("serving metrics at localhost:2223/metrics")
+	http.Handle("/metrics", promhttp.Handler())
+	err := http.ListenAndServe(":2223", nil)
+	if err != nil {
+		log.WithError(err).Fatal("Error serving metrics over HTTP")
+	}
+}
+
+func generateTrigonoMetrics(meter api.Meter, attrs []attribute.KeyValue, wg *sync.WaitGroup, ctx context.Context) {
 	interval := time.Second
 	log.Infof("Starting trigonometric metrics generation every %s", interval)
 
@@ -69,9 +87,28 @@ func generateTrigonoMetrics(wg *sync.WaitGroup, done chan interface{}) {
 	go func() {
 		var degrees int
 		var ticks int
+		var radians float64
 		multiplier := 100.
 
 		trigPeriod := int(time.Minute / interval) // Absolute trigonometric period; change every minute
+
+		// Create metrics
+		if err := observableGauge(meter, "sine", "sine gauge", attrs, func() float64 {
+			return math.Abs(math.Sin(radians)) * multiplier
+		}); err != nil {
+			log.Fatal(err)
+		}
+
+		if err := observableGauge(meter, "cosine", "cosine gauge", attrs, func() float64 {
+			return math.Abs(math.Cos(radians)) * multiplier
+		}); err != nil {
+			log.Fatal(err)
+		}
+
+		counter, err := meter.Float64Counter("trigonometric_counter", instrument.WithDescription("trigonometric counter"))
+		if err != nil {
+			log.Fatal(err)
+		}
 
 		for {
 			select {
@@ -87,17 +124,10 @@ func generateTrigonoMetrics(wg *sync.WaitGroup, done chan interface{}) {
 				}
 				ticks++
 
-				radians := (float64(degrees) * math.Pi) / 180
+				radians = (float64(degrees) * math.Pi) / 180
 
-				log.Debugf("Radians: %v", radians*multiplier)
-				// cm.Gauge("ExampleMetric", "Sine").SetValue(math.Abs(math.Sin(radians)) * multiplier)
-				// cm.Gauge("ExampleMetric", "Cosine").SetValue(math.Abs(math.Cos(radians)) * multiplier)
-				// cm.Rate("ExampleMetric", "Rate").Increment()
-				// cm.State("ExampleMetric", "State").SetValue(chainmonitoring.StateOK)
-
-				// cm.Stats("ExampleStats", "Rate").IncrementOK()
-
-			case <-done:
+				counter.Add(ctx, 1, attrs...)
+			case <-ctx.Done():
 				log.Info("Stopping trigonometric metrics generation")
 				ticker.Stop()
 				wg.Done()
@@ -105,6 +135,21 @@ func generateTrigonoMetrics(wg *sync.WaitGroup, done chan interface{}) {
 			}
 		}
 	}()
+}
+
+func observableGauge(meter api.Meter, name string, description string, attrs []attribute.KeyValue, valueFunc func() float64) error {
+	gauge, err := meter.Float64ObservableGauge(name, instrument.WithDescription(description))
+	if err != nil {
+		return err
+	}
+	_, err = meter.RegisterCallback(func(_ context.Context, o api.Observer) error {
+		o.ObserveFloat64(gauge, valueFunc(), attrs...)
+		return nil
+	}, gauge)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return nil
 }
 
 func getRandomStatus() int {
@@ -164,7 +209,7 @@ func doHTTPRequest(client *http.Client, uri *url.URL, pattern string) error {
 	return nil
 }
 
-func generateStandardHTTPMetrics(wg *sync.WaitGroup, done chan interface{}) {
+func generateStandardHTTPMetrics(meter api.Meter, attrs []attribute.KeyValue, wg *sync.WaitGroup, ctx context.Context) {
 	interval := time.Millisecond * 500
 	log.Infof("Starting standard HTTP metrics generation every %s", interval)
 
@@ -202,7 +247,7 @@ func generateStandardHTTPMetrics(wg *sync.WaitGroup, done chan interface{}) {
 				if err := doHTTPRequest(client, uri, "/"); err != nil {
 					log.WithError(err).Errorf("Cannot do request to %s", server.URL)
 				}
-			case <-done:
+			case <-ctx.Done():
 				log.Info("Stopping standard HTTP metrics generation")
 				ticker.Stop()
 				server.Close()
@@ -213,7 +258,7 @@ func generateStandardHTTPMetrics(wg *sync.WaitGroup, done chan interface{}) {
 	}()
 }
 
-func generateGorillaHTTPMetrics(wg *sync.WaitGroup, done chan interface{}) {
+func generateGorillaHTTPMetrics(meter api.Meter, attrs []attribute.KeyValue, wg *sync.WaitGroup, ctx context.Context) {
 	interval := time.Millisecond * 500
 	log.Infof("Starting Gorilla HTTP metrics generation every %s", interval)
 
@@ -274,7 +319,7 @@ func generateGorillaHTTPMetrics(wg *sync.WaitGroup, done chan interface{}) {
 						log.WithError(err).Errorf("Cannot do request to %s", uri)
 					}
 				}
-			case <-done:
+			case <-ctx.Done():
 				log.Info("Stopping Gorilla HTTP metrics generation")
 				ticker.Stop()
 				wg.Done()
