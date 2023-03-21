@@ -17,9 +17,6 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-
 	"go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -33,6 +30,8 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
 	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -58,11 +57,35 @@ func main() {
 		log.Debug("Goroutines finished")
 	}()
 
+	// Set up attributes (tags) and resource for metrics and traces
+	attrs := []attribute.KeyValue{
+		attribute.Key("service").String(service),
+		attribute.Key("team").String(team),
+	}
+	res, err := resource.New(ctx,
+		resource.WithAttributes(
+			attrs...,
+		),
+	)
+	if err != nil {
+		log.WithError(err).Fatal("Failed to create resource")
+	}
+
 	// Set up the Prometheus metrics metricsExporter
 	metricsExporter, err := prometheus.New()
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	// Set up the OpenTelemetry metrics stack
+	meterProvider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(metricsExporter),
+		sdkmetric.WithResource(res),
+	)
+	meter := meterProvider.Meter(service)
+
+	// Start the Prometheus HTTP server
+	go serveMetrics()
 
 	// Set up the OpenTelemetry gRPC trace exporter
 	conn, err := grpc.DialContext(ctx, os.Getenv(grpcCollectorAddressEnvKey),
@@ -74,10 +97,6 @@ func main() {
 		log.WithError(err).Fatal("Failed to create gRPC connection to collector")
 	}
 
-	// Set up the OpenTelemetry metrics stack
-	meterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(metricsExporter))
-	meter := meterProvider.Meter(service)
-
 	// Set up the OpenTelemetry tracing stack
 	// Set up a trace exporter
 	traceExporter, err := otlptracegrpc.New(ctx, otlptracegrpc.WithGRPCConn(conn))
@@ -87,15 +106,6 @@ func main() {
 
 	// Register the trace exporter with a TracerProvider, using a batch
 	// span processor to aggregate spans before export.
-	res, err := resource.New(ctx,
-		resource.WithAttributes(
-			// the service name used to display traces in backends
-			semconv.ServiceName(service),
-		),
-	)
-	if err != nil {
-		log.WithError(err).Fatal("Failed to create resource")
-	}
 	bsp := sdktrace.NewBatchSpanProcessor(traceExporter)
 	tracerProvider := sdktrace.NewTracerProvider(
 		sdktrace.WithSampler(sdktrace.AlwaysSample()),
@@ -109,24 +119,15 @@ func main() {
 
 	tracer := otel.Tracer(service)
 
-	// Start the Prometheus HTTP server
-	go serveMetrics()
-
-	// Set up attributes (tags)
-	attrs := []attribute.KeyValue{
-		attribute.Key("service").String(service),
-		attribute.Key("team").String(team),
-	}
-
-	generateTrigonoMetrics(meter, attrs, &wg, ctx)
-	generateStandardHTTPMetrics(tracer, attrs, &wg, ctx)
-	generateGorillaHTTPMetrics(tracer, attrs, &wg, ctx)
+	generateTrigonoMetrics(meter, &wg, ctx)
+	generateStandardHTTPMetrics(tracer, &wg, ctx)
+	generateGorillaHTTPMetrics(tracer, &wg, ctx)
 
 	waitForInterrupt()
 }
 
 func serveMetrics() {
-	log.Printf("serving metrics at localhost:2223/metrics")
+	log.Infof("Serving metrics at localhost:2223/metrics")
 	http.Handle("/metrics", promhttp.Handler())
 	err := http.ListenAndServe(":2223", nil)
 	if err != nil {
@@ -134,7 +135,7 @@ func serveMetrics() {
 	}
 }
 
-func generateTrigonoMetrics(meter metric.Meter, attrs []attribute.KeyValue, wg *sync.WaitGroup, ctx context.Context) {
+func generateTrigonoMetrics(meter metric.Meter, wg *sync.WaitGroup, ctx context.Context) {
 	interval := time.Second
 	log.Infof("Starting trigonometric metrics generation every %s", interval)
 
@@ -150,15 +151,16 @@ func generateTrigonoMetrics(meter metric.Meter, attrs []attribute.KeyValue, wg *
 		trigPeriod := int(time.Minute / interval) // Absolute trigonometric period; change every minute
 
 		// Create metrics
-		if err := observableGauge(meter, "sine", "sine gauge", attrs, func() float64 {
-			return math.Abs(math.Sin(radians)) * multiplier
-		}); err != nil {
+		gauge, err := meter.Float64ObservableGauge("trigonometric_gauge", instrument.WithDescription("trigonometric gauge"))
+		if err != nil {
 			log.Fatal(err)
 		}
-
-		if err := observableGauge(meter, "cosine", "cosine gauge", attrs, func() float64 {
-			return math.Abs(math.Cos(radians)) * multiplier
-		}); err != nil {
+		_, err = meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+			o.ObserveFloat64(gauge, math.Abs(math.Sin(radians))*multiplier, attribute.Key("function").String("sine"))
+			o.ObserveFloat64(gauge, math.Abs(math.Cos(radians))*multiplier, attribute.Key("function").String("cosine"))
+			return nil
+		}, gauge)
+		if err != nil {
 			log.Fatal(err)
 		}
 
@@ -182,8 +184,8 @@ func generateTrigonoMetrics(meter metric.Meter, attrs []attribute.KeyValue, wg *
 				ticks++
 
 				radians = (float64(degrees) * math.Pi) / 180
+				counter.Add(ctx, 1)
 
-				counter.Add(ctx, 1, attrs...)
 			case <-ctx.Done():
 				log.Info("Stopping trigonometric metrics generation")
 				ticker.Stop()
@@ -192,21 +194,6 @@ func generateTrigonoMetrics(meter metric.Meter, attrs []attribute.KeyValue, wg *
 			}
 		}
 	}()
-}
-
-func observableGauge(meter metric.Meter, name string, description string, attrs []attribute.KeyValue, valueFunc func() float64) error {
-	gauge, err := meter.Float64ObservableGauge(name, instrument.WithDescription(description))
-	if err != nil {
-		return err
-	}
-	_, err = meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
-		o.ObserveFloat64(gauge, valueFunc(), attrs...)
-		return nil
-	}, gauge)
-	if err != nil {
-		log.Fatal(err)
-	}
-	return nil
 }
 
 func getRandomStatus() int {
@@ -257,7 +244,7 @@ func doHTTPRequest(tracer trace.Tracer, client *http.Client, uri *url.URL, patte
 	return nil
 }
 
-func generateStandardHTTPMetrics(tracer trace.Tracer, attrs []attribute.KeyValue, wg *sync.WaitGroup, ctx context.Context) {
+func generateStandardHTTPMetrics(tracer trace.Tracer, wg *sync.WaitGroup, ctx context.Context) {
 	interval := time.Millisecond * 500
 	log.Infof("Starting standard HTTP metrics generation every %s", interval)
 
@@ -294,7 +281,7 @@ func generateStandardHTTPMetrics(tracer trace.Tracer, attrs []attribute.KeyValue
 	}()
 }
 
-func generateGorillaHTTPMetrics(tracer trace.Tracer, attrs []attribute.KeyValue, wg *sync.WaitGroup, ctx context.Context) {
+func generateGorillaHTTPMetrics(tracer trace.Tracer, wg *sync.WaitGroup, ctx context.Context) {
 	interval := time.Millisecond * 500
 	log.Infof("Starting Gorilla HTTP metrics generation every %s", interval)
 
