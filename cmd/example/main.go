@@ -89,22 +89,23 @@ func main() {
 	var tracer trace.Tracer
 
 	// Set up the OpenTelemetry gRPC trace exporter
-	conn, err := grpc.DialContext(ctx, os.Getenv(grpcCollectorAddressEnvKey),
+	addr := os.Getenv(grpcCollectorAddressEnvKey)
+	log.Infof("Setting up gRPC connection to OpenTelemetry collector at %s", addr)
+	conn, err := grpc.DialContext(ctx, addr,
 		// Note the use of insecure transport here. TLS is recommended in production.
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
 	if err != nil {
-		log.WithError(err).Error("Failed to create gRPC connection to collector")
+		log.WithError(err).Errorf("Failed to create gRPC connection to OpenTelemetry collector at %s")
 	} else {
-		log.Info("Set up tracing - 1")
+		defer conn.Close()
+
 		// Set up the OpenTelemetry tracing stack
 		// Set up a trace exporter
 		traceExporter, err := otlptracegrpc.New(ctx, otlptracegrpc.WithGRPCConn(conn))
 		if err != nil {
 			log.WithError(err).Fatal("Failed to create trace exporter: %w", err)
 		}
-
-		log.Info("Set up tracing - 2")
 
 		// Register the trace exporter with a TracerProvider, using a batch
 		// span processor to aggregate spans before export.
@@ -118,7 +119,6 @@ func main() {
 
 		// set global propagator to tracecontext (the default is no-op).
 		// otel.SetTextMapPropagator(propagation.TraceContext{})
-		log.Info("Set up tracing - 3")
 
 		tracer = otel.Tracer(service)
 	}

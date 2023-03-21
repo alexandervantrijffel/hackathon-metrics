@@ -9,7 +9,7 @@ services:
       - '2223:2223'
     hostname: example-api
     environment:
-      - OTEL_GRPC_COLLECTOR_ADDRESS='telegraf:4317'
+      - OTEL_GRPC_COLLECTOR_ADDRESS=telegraf:4317
 
   influxdb:
     container_name: influxdb
