@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"os/signal"
@@ -19,18 +20,18 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
-	otel_prometheus_exporter "go.opentelemetry.io/otel/exporters/prometheus"
-	sdkmetric "go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/exporters/prometheus"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/instrument"
+	"go.opentelemetry.io/otel/propagation"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
-
-	"go.opentelemetry.io/otel/metric/instrument"
-	"go.opentelemetry.io/otel/propagation"
-	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/trace"
 
 	log "github.com/sirupsen/logrus"
@@ -58,7 +59,7 @@ func main() {
 	}()
 
 	// Set up the Prometheus metrics metricsExporter
-	metricsExporter, err := otel_prometheus_exporter.New()
+	metricsExporter, err := prometheus.New()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -74,7 +75,7 @@ func main() {
 	}
 
 	// Set up the OpenTelemetry metrics stack
-	meterProvider := metric.NewMeterProvider(metric.WithReader(metricsExporter))
+	meterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(metricsExporter))
 	meter := meterProvider.Meter(service)
 
 	// Set up the OpenTelemetry tracing stack
@@ -133,7 +134,7 @@ func serveMetrics() {
 	}
 }
 
-func generateTrigonoMetrics(meter sdkmetric.Meter, attrs []attribute.KeyValue, wg *sync.WaitGroup, ctx context.Context) {
+func generateTrigonoMetrics(meter metric.Meter, attrs []attribute.KeyValue, wg *sync.WaitGroup, ctx context.Context) {
 	interval := time.Second
 	log.Infof("Starting trigonometric metrics generation every %s", interval)
 
@@ -193,12 +194,12 @@ func generateTrigonoMetrics(meter sdkmetric.Meter, attrs []attribute.KeyValue, w
 	}()
 }
 
-func observableGauge(meter sdkmetric.Meter, name string, description string, attrs []attribute.KeyValue, valueFunc func() float64) error {
+func observableGauge(meter metric.Meter, name string, description string, attrs []attribute.KeyValue, valueFunc func() float64) error {
 	gauge, err := meter.Float64ObservableGauge(name, instrument.WithDescription(description))
 	if err != nil {
 		return err
 	}
-	_, err = meter.RegisterCallback(func(_ context.Context, o sdkmetric.Observer) error {
+	_, err = meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
 		o.ObserveFloat64(gauge, valueFunc(), attrs...)
 		return nil
 	}, gauge)
@@ -234,37 +235,24 @@ func getHTTPHandlerFunc(tracer trace.Tracer, traceName string, minDelay int, max
 	})
 }
 
-func doHTTPRequest(client *http.Client, uri *url.URL, pattern string) error {
+func doHTTPRequest(tracer trace.Tracer, client *http.Client, uri *url.URL, pattern string, ctx context.Context) error {
 	log.Tracef("Doing HTTP request to %s", uri)
 
+	ctx, span := tracer.Start(ctx, pattern, trace.WithAttributes(semconv.PeerService(service)))
+	defer span.End()
+
+	ctx = httptrace.WithClientTrace(ctx, otelhttptrace.NewClientTrace(ctx))
+
 	// Set up request
-	req, err := http.NewRequest("GET", uri.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", uri.String(), nil)
 	if err != nil {
 		return err
 	}
 
-	// TODO: measure HTTP request time with metrics SDK
-	// pm := httpmetrics.NewPathPatternMatcher()
-	// pm.AddPattern(pattern)
-
-	// ctx, trace, err := httpmetrics.WithPatternMatchingClientTrace(req.Context(), cm, "ExampleHTTPClientMetric", pm)
-	// if err != nil {
-	// 	return err
-	// }
-	// req = req.WithContext(ctx)
-
-	// Do request
-	// res, err := client.Do(req)
 	_, err = client.Do(req)
 	if err != nil {
 		return err
 	}
-
-	// End trace
-	// err = trace.End(res)
-	// if err != nil {
-	// 	return err
-	// }
 
 	return nil
 }
@@ -278,7 +266,7 @@ func generateStandardHTTPMetrics(tracer trace.Tracer, attrs []attribute.KeyValue
 	max := 100
 
 	// Set up HTTP server metrics
-	server := httptest.NewServer(getHTTPHandlerFunc(tracer, "http.server.net", min, max))
+	server := httptest.NewServer(getHTTPHandlerFunc(tracer, "/", min, max))
 
 	wg.Add(1)
 	go func() {
@@ -292,7 +280,7 @@ func generateStandardHTTPMetrics(tracer trace.Tracer, attrs []attribute.KeyValue
 			case <-ticker.C:
 				uri, _ := url.ParseRequestURI(server.URL)
 				uri = uri.JoinPath("/")
-				if err := doHTTPRequest(client, uri, "/"); err != nil {
+				if err := doHTTPRequest(tracer, client, uri, "/", ctx); err != nil {
 					log.WithError(err).Errorf("Cannot do request to %s", server.URL)
 				}
 			case <-ctx.Done():
@@ -314,10 +302,9 @@ func generateGorillaHTTPMetrics(tracer trace.Tracer, attrs []attribute.KeyValue,
 	r := mux.NewRouter()
 
 	// Add paths
-	traceName := "http.server.mux"
-	r.Methods("GET").Path("/").HandlerFunc(getHTTPHandlerFunc(tracer, traceName, 10, 100))
-	r.Methods("GET").Path("/test1").HandlerFunc(getHTTPHandlerFunc(tracer, traceName, 50, 150))
-	r.Methods("GET").Path("/test1/{resource1}").HandlerFunc(getHTTPHandlerFunc(tracer, traceName, 20, 50))
+	r.Methods("GET").Path("/").HandlerFunc(getHTTPHandlerFunc(tracer, "/", 10, 100))
+	r.Methods("GET").Path("/test1").HandlerFunc(getHTTPHandlerFunc(tracer, "/test1", 50, 150))
+	r.Methods("GET").Path("/test1/{resource1}").HandlerFunc(getHTTPHandlerFunc(tracer, "/test1/{resource1}", 20, 50))
 
 	// Get random port for server and serve
 	listener, err := net.Listen("tcp", ":0")
@@ -354,7 +341,7 @@ func generateGorillaHTTPMetrics(tracer trace.Tracer, attrs []attribute.KeyValue,
 					if err != nil {
 						log.WithError(err).Errorf("Cannot compose URL %s%s", host, path)
 					}
-					if err := doHTTPRequest(client, uri, pattern); err != nil {
+					if err := doHTTPRequest(tracer, client, uri, pattern, ctx); err != nil {
 						log.WithError(err).Errorf("Cannot do request to %s", uri)
 					}
 				}
