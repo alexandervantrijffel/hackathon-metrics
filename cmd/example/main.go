@@ -26,7 +26,7 @@ import (
 	"go.opentelemetry.io/otel/metric/instrument"
 	"go.opentelemetry.io/otel/propagation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
-	"go.opentelemetry.io/otel/sdk/resource"
+	sdkresource "go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
 	"go.opentelemetry.io/otel/trace"
@@ -62,8 +62,8 @@ func main() {
 		attribute.Key("service").String(service),
 		attribute.Key("team").String(team),
 	}
-	res, err := resource.New(ctx,
-		resource.WithAttributes(
+	res, err := sdkresource.New(ctx,
+		sdkresource.WithAttributes(
 			attrs...,
 		),
 	)
@@ -71,7 +71,7 @@ func main() {
 		log.WithError(err).Fatal("Failed to create resource")
 	}
 
-	// Set up the Prometheus metrics metricsExporter
+	// Set up the Prometheus metrics exporter
 	metricsExporter, err := prometheus.New()
 	if err != nil {
 		log.Fatal(err)
@@ -87,6 +87,8 @@ func main() {
 	// Start the Prometheus HTTP server
 	go serveMetrics()
 
+	var tracer trace.Tracer
+
 	// Set up the OpenTelemetry gRPC trace exporter
 	conn, err := grpc.DialContext(ctx, os.Getenv(grpcCollectorAddressEnvKey),
 		// Note the use of insecure transport here. TLS is recommended in production.
@@ -94,30 +96,30 @@ func main() {
 		grpc.WithBlock(),
 	)
 	if err != nil {
-		log.WithError(err).Fatal("Failed to create gRPC connection to collector")
+		log.WithError(err).Error("Failed to create gRPC connection to collector")
+	} else {
+		// Set up the OpenTelemetry tracing stack
+		// Set up a trace exporter
+		traceExporter, err := otlptracegrpc.New(ctx, otlptracegrpc.WithGRPCConn(conn))
+		if err != nil {
+			log.WithError(err).Fatal("Failed to create trace exporter: %w", err)
+		}
+
+		// Register the trace exporter with a TracerProvider, using a batch
+		// span processor to aggregate spans before export.
+		bsp := sdktrace.NewBatchSpanProcessor(traceExporter)
+		tracerProvider := sdktrace.NewTracerProvider(
+			sdktrace.WithSampler(sdktrace.AlwaysSample()),
+			sdktrace.WithResource(res),
+			sdktrace.WithSpanProcessor(bsp),
+		)
+		otel.SetTracerProvider(tracerProvider)
+
+		// set global propagator to tracecontext (the default is no-op).
+		otel.SetTextMapPropagator(propagation.TraceContext{})
+
+		tracer = otel.Tracer(service)
 	}
-
-	// Set up the OpenTelemetry tracing stack
-	// Set up a trace exporter
-	traceExporter, err := otlptracegrpc.New(ctx, otlptracegrpc.WithGRPCConn(conn))
-	if err != nil {
-		log.WithError(err).Fatal("Failed to create trace exporter: %w", err)
-	}
-
-	// Register the trace exporter with a TracerProvider, using a batch
-	// span processor to aggregate spans before export.
-	bsp := sdktrace.NewBatchSpanProcessor(traceExporter)
-	tracerProvider := sdktrace.NewTracerProvider(
-		sdktrace.WithSampler(sdktrace.AlwaysSample()),
-		sdktrace.WithResource(res),
-		sdktrace.WithSpanProcessor(bsp),
-	)
-	otel.SetTracerProvider(tracerProvider)
-
-	// set global propagator to tracecontext (the default is no-op).
-	otel.SetTextMapPropagator(propagation.TraceContext{})
-
-	tracer := otel.Tracer(service)
 
 	generateTrigonoMetrics(meter, &wg, ctx)
 	generateStandardHTTPMetrics(tracer, &wg, ctx)
@@ -156,6 +158,7 @@ func generateTrigonoMetrics(meter metric.Meter, wg *sync.WaitGroup, ctx context.
 			log.Fatal(err)
 		}
 		_, err = meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+			log.Trace("Observing trigonometric gauge")
 			o.ObserveFloat64(gauge, math.Abs(math.Sin(radians))*multiplier, attribute.Key("function").String("sine"))
 			o.ObserveFloat64(gauge, math.Abs(math.Cos(radians))*multiplier, attribute.Key("function").String("cosine"))
 			return nil
@@ -210,9 +213,11 @@ func getRandomStatus() int {
 
 func getHTTPHandlerFunc(tracer trace.Tracer, traceName string, minDelay int, maxDelay int) http.HandlerFunc {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx := r.Context()
-		_, span := tracer.Start(ctx, traceName)
-		defer span.End()
+		if tracer != nil {
+			ctx := r.Context()
+			_, span := tracer.Start(ctx, traceName)
+			defer span.End()
+		}
 
 		sleep := rand.Intn(maxDelay-minDelay) + minDelay
 		status := getRandomStatus()
@@ -225,10 +230,13 @@ func getHTTPHandlerFunc(tracer trace.Tracer, traceName string, minDelay int, max
 func doHTTPRequest(tracer trace.Tracer, client *http.Client, uri *url.URL, pattern string, ctx context.Context) error {
 	log.Tracef("Doing HTTP request to %s", uri)
 
-	ctx, span := tracer.Start(ctx, pattern, trace.WithAttributes(semconv.PeerService(service)))
-	defer span.End()
+	if tracer != nil {
+		var span trace.Span
+		ctx, span = tracer.Start(ctx, pattern, trace.WithAttributes(semconv.PeerService(service)))
+		defer span.End()
 
-	ctx = httptrace.WithClientTrace(ctx, otelhttptrace.NewClientTrace(ctx))
+		ctx = httptrace.WithClientTrace(ctx, otelhttptrace.NewClientTrace(ctx))
+	}
 
 	// Set up request
 	req, err := http.NewRequestWithContext(ctx, "GET", uri.String(), nil)
